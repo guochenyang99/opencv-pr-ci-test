@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 Hygon Information Technology Co., Ltd.
+
+name: PR authorization smoke test
+run-name: "PR smoke test - #${{ github.event.pull_request.number }}"
+
+# Install this trusted workflow on the default branch.
+# Require "PR build result" in branch protection.
+on:
+  pull_request_target:
+    branches: [4.9.0]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  # Unrelated labels use a separate group and cannot replace a pending build.
+  group: >-
+    opencv-python-das-pr-build-${{ github.event.pull_request.number }}-${{
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+      github.event.label.name != 'ready-build' && github.run_id || 'build'
+    }}
+  cancel-in-progress: true
+
+jobs:
+  authorize-pr:
+    name: Authorize self-hosted build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      authorized: ${{ steps.authorization.outputs.authorized }}
+    steps:
+      - uses: actions/github-script@v7
+        id: authorization
+        with:
+          script: |
+            const label = "ready-build";
+            const action = context.payload.action;
+            const expected = context.payload.pull_request;
+            const labelEvent = ["labeled", "unlabeled"].includes(action);
+            const prActions = ["opened", "synchronize", "reopened", "ready_for_review"];
+            core.setOutput("authorized", "false");
+            if (labelEvent && context.payload.label?.name !== label) return;
+            if (!labelEvent && !prActions.includes(action)) {
+              core.setFailed("Unsupported PR action: " + action);
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: expected.number,
+            });
+            if (pr.state !== "open" || pr.base.ref !== "4.9.0" || !pr.head.repo ||
+                pr.head.sha !== expected.head.sha || pr.base.sha !== expected.base.sha) {
+              core.setFailed("PR state/head/base changed. Trigger a fresh build.");
+              return;
+            }
+            const repo = context.repo.owner + "/" + context.repo.repo;
+            if (pr.head.repo.full_name.toLowerCase() === repo.toLowerCase()) {
+              core.setOutput("authorized", "true");
+              return;
+            }
+            if (action === "unlabeled" || !pr.labels.some(item => item.name === label)) {
+              core.setFailed("Fork PR requires a maintainer to apply ready-build.");
+              return;
+            }
+            // Approval persists across PR updates until ready-build is removed.
+            // Check the label author, since later pushes can come from the contributor.
+            const events = await github.paginate(github.rest.issues.listEvents, {
+              ...context.repo, issue_number: pr.number, per_page: 100,
+            });
+            const approval = events.filter(item =>
+              ["labeled", "unlabeled"].includes(item.event) && item.label?.name === label
+            ).sort((a, b) => b.id - a.id)[0];
+            if (approval?.event !== "labeled" || !approval.actor?.login) {
+              core.setFailed("No current ready-build approval could be verified.");
+              return;
+            }
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo, username: approval.actor.login,
+            });
+            if (!["write", "maintain", "admin"].includes(data.permission)) {
+              core.setFailed(approval.actor.login + " cannot authorize this build.");
+              return;
+            }
+            core.info(approval.actor.login + " authorized PR #" + pr.number + "; building " + pr.head.sha);
+            core.setOutput("authorized", "true");
+
+  # Cloud smoke test only; no GPU build or wheel tests are performed here.
+  build-wheel:
+    name: Smoke test checkout and merge (no GPU build)
+    needs: authorize-pr
+    if: needs.authorize-pr.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          submodules: false
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge authorized PR revision
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          test "$(git rev-parse HEAD)" = "${BASE_SHA}"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\r\n')"
+          echo "::add-mask::${auth}"
+          git -c "http.extraheader=AUTHORIZATION: basic ${auth}" fetch --no-tags \
+            --no-recurse-submodules origin "+refs/pull/${PR_NUMBER}/head"
+          if ! git cat-file -e "${HEAD_SHA}^{commit}"; then
+            git -c "http.extraheader=AUTHORIZATION: basic ${auth}" \
+              fetch --no-tags --no-recurse-submodules origin "${HEAD_SHA}"
+          fi
+          unset auth GH_TOKEN
+          git -c user.name='PR build' -c user.email='pr-build@localhost' \
+            merge --no-ff --no-edit "${HEAD_SHA}"
+          echo "base=${BASE_SHA} head=${HEAD_SHA} integration=$(git rev-parse HEAD)"
+
+      - name: Verify smoke fixture and record scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f smoke.txt
+          if [[ -f smoke-fail ]]; then
+            echo 'Intentional smoke-test failure' >&2
+            exit 1
+          fi
+          echo '### Authorization and Git merge smoke test' >> "${GITHUB_STEP_SUMMARY}"
+          echo 'Checkout and merge succeeded. GPU compilation and wheel tests were not run.' >> "${GITHUB_STEP_SUMMARY}"
+
+  ci-result:
+    name: >-
+      ${{
+        (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+        github.event.label.name != 'ready-build' &&
+        'Ignored label event' || 'PR build result'
+      }}
+    needs: [authorize-pr, build-wheel]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject cancelled runs
+        if: cancelled()
+        run: exit 1
+      - uses: actions/github-script@v7
+        env:
+          AUTH_RESULT: ${{ needs.authorize-pr.result }}
+          AUTHORIZED: ${{ needs.authorize-pr.outputs.authorized }}
+          BUILD_RESULT: ${{ needs.build-wheel.result }}
+        with:
+          script: |
+            const action = context.payload.action;
+            if (["labeled", "unlabeled"].includes(action) &&
+                context.payload.label?.name !== "ready-build") return;
+            if (process.env.AUTH_RESULT !== "success" ||
+                process.env.AUTHORIZED !== "true" || process.env.BUILD_RESULT !== "success") {
+              core.setFailed("An authorized build and all wheel tests must succeed.");
+              return;
+            }
+            const expected = context.payload.pull_request;
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: expected.number,
+            });
+            const repo = context.repo.owner + "/" + context.repo.repo;
+            const sameRepo = pr.head.repo?.full_name.toLowerCase() === repo.toLowerCase();
+            if (pr.state !== "open" || pr.base.ref !== "4.9.0" || !pr.head.repo ||
+                pr.head.sha !== expected.head.sha || pr.base.sha !== expected.base.sha ||
+                (!sameRepo && !pr.labels.some(item => item.name === "ready-build"))) {
+              core.setFailed("PR state/head/base or authorization changed. A fresh build is required.");
+            }
