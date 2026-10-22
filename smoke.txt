@@ -1,2 +1,3 @@
 OpenCV PR CI smoke fixture
 Same-repository PR: initial commit
+Same-repository PR: update without ready-build
